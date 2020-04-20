@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use crate::{Error, HashDigest};
 use crate::index::{MAX_BLOCK_SIZE, ZPAQ_BITS, Index, IndexTransaction};
-use crate::sync::{IndexEvent, Sink, SinkWrapper, Source, SourceWrapper};
+use crate::sync::{Sink, SinkEvent, SinkWrapper, Source, SourceEvent, SourceWrapper};
 
 struct TempFile {
     file: File,
@@ -63,6 +63,7 @@ pub struct FsSink<'a> {
     current_file: Option<(usize, Rc<RefCell<TempFile>>)>,
     waiting_blocks: HashMap<HashDigest, Vec<BlockDestination>>,
     blocks_to_request: VecDeque<HashDigest>,
+    end: bool,
 }
 
 impl<'a> FsSink<'a> {
@@ -74,6 +75,7 @@ impl<'a> FsSink<'a> {
             current_file: None,
             waiting_blocks: HashMap::new(),
             blocks_to_request: VecDeque::new(),
+            end: false,
         }
     }
 
@@ -95,9 +97,7 @@ impl<'a> FsSink<'a> {
         }
         Ok(())
     }
-}
 
-impl<'a> Sink for FsSink<'a> {
     fn new_file(
         &mut self,
         name: &Path,
@@ -218,10 +218,6 @@ impl<'a> Sink for FsSink<'a> {
         Ok(())
     }
 
-    fn end_files(&mut self) -> Result<(), Error> {
-        self.end_current_file()
-    }
-
     fn feed_block(
         &mut self,
         hash: &HashDigest,
@@ -254,9 +250,29 @@ impl<'a> Sink for FsSink<'a> {
         }
         Ok(())
     }
+}
 
-    fn next_requested_block(&mut self) -> Result<Option<HashDigest>, Error> {
-        Ok(self.blocks_to_request.pop_front())
+impl<'a> Sink for FsSink<'a> {
+    fn next_event(&mut self) -> Result<Option<SinkEvent>, Error> {
+        if let Some(hash) = self.blocks_to_request.pop_front() {
+            Ok(Some(SinkEvent::BlockRequest(hash)))
+        } else if self.end {
+            Ok(Some(SinkEvent::End))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn feed_event(&mut self, event: SourceEvent) -> Result<(), Error> {
+        match event {
+            SourceEvent::NewFile(name, modified) => self.new_file(&name, modified),
+            SourceEvent::NewBlock(hash, size) => self.new_block(&hash, size),
+            SourceEvent::End => {
+                self.end = true;
+                self.end_current_file()
+            }
+            SourceEvent::BlockData(hash, block) => self.feed_block(&hash, &block),
+        }
     }
 
     fn is_missing_blocks(&self) -> Result<bool, Error> {
@@ -267,6 +283,7 @@ impl<'a> Sink for FsSink<'a> {
 /// Local filesystem source, e.g. `Source` that reads files
 pub struct FsSource<'a> {
     index: IndexTransaction<'a>,
+    end: bool,
     root_dir: &'a Path,
     files: VecDeque<(u32, PathBuf, chrono::DateTime<chrono::Utc>)>,
     blocks: VecDeque<(HashDigest, usize)>,
@@ -283,6 +300,7 @@ impl<'a> FsSource<'a> {
         info!("Source indexed, {} files", files.len());
         Ok(FsSource {
             index,
+            end: false,
             root_dir,
             files,
             blocks: VecDeque::new(),
@@ -292,10 +310,25 @@ impl<'a> FsSource<'a> {
 }
 
 impl<'a> Source for FsSource<'a> {
-    fn next_from_index(&mut self) -> Result<Option<IndexEvent>, Error> {
+    fn next_event(&mut self) -> Result<SourceEvent, Error> {
+        // If there are requested blocks
+        if let Some(hash) = self.requested_blocks.pop_front() {
+            if let Some((name, offset, _)) = self.index.get_block(&hash)?  {
+                return Ok(SourceEvent::BlockData(
+                    hash,
+                    read_block(&self.root_dir.join(name), offset)?,
+                ));
+            } else {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "Unknown block requested",
+                )));
+            }
+        }
+
         // If there are blocks left in current file, return one
         if let Some((hash, size)) = self.blocks.pop_front() {
-            return Ok(Some(IndexEvent::NewBlock(hash, size)));
+            return Ok(SourceEvent::NewBlock(hash, size));
         }
 
         // If there are more files left, read the next one in
@@ -305,39 +338,22 @@ impl<'a> Source for FsSource<'a> {
                 .into_iter()
                 .map(|(hash, _offset, size)| (hash, size))
                 .collect();
-            return Ok(Some(IndexEvent::NewFile(name, modified)));
+            return Ok(SourceEvent::NewFile(name, modified));
         }
 
         // No more files
-        Ok(Some(IndexEvent::End))
+        self.end = true;
+        Ok(SourceEvent::End)
     }
 
-    fn request_block(&mut self, hash: &HashDigest) -> Result<(), Error> {
-        self.requested_blocks.push_back(hash.clone());
-        Ok(())
-    }
-
-    fn get_next_block(
-        &mut self,
-    ) -> Result<Option<(HashDigest, Vec<u8>)>, Error> {
-        match self.requested_blocks.pop_front() {
-            Some(hash) => {
-                if let Some((name, offset, _size)) =
-                    self.index.get_block(&hash)?
-                {
-                    Ok(Some((
-                        hash,
-                        read_block(&self.root_dir.join(name), offset)?,
-                    )))
-                } else {
-                    Err(Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "Unknown block requested",
-                    )))
-                }
+    fn feed_event(&mut self, event: SinkEvent) -> Result<(), Error> {
+        match event {
+            SinkEvent::BlockRequest(hash) => {
+                self.requested_blocks.push_back(hash.clone());
             }
-            None => Ok(None),
+            SinkEvent::End => {}
         }
+        Ok(())
     }
 }
 

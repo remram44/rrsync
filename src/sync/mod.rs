@@ -22,11 +22,37 @@
 //! which are fed in as they are received.
 
 pub mod fs;
+pub mod ssh;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::{Error, HashDigest};
-use crate::index::IndexTransaction;
+
+/// Events from the sink.
+#[derive(Debug)]
+pub enum SinkEvent {
+    /// A block is needed
+    BlockRequest(HashDigest),
+
+    /// The sink does not need further blocks
+    End,
+}
+
+/// Events from the source.
+#[derive(Debug)]
+pub enum SourceEvent {
+    /// Start a new file (e.g. next `NewBlock` are blocks of that file)
+    NewFile(PathBuf, chrono::DateTime<chrono::Utc>),
+
+    /// Add a new block to the current file
+    NewBlock(HashDigest, usize),
+
+    /// No more instructions
+    End,
+
+    /// Data for a block that was requested
+    BlockData(HashDigest, Vec<u8>),
+}
 
 /// The sink, representing where the files are being sent.
 ///
@@ -34,48 +60,12 @@ use crate::index::IndexTransaction;
 /// encapsulating some network protocol, and the receiving side has a sink that
 /// actually updates files.
 pub trait Sink {
-    /// Start on a new file
-    fn new_file(
-        &mut self,
-        path: &Path,
-        modified: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), Error>;
+    fn next_event(&mut self) -> Result<Option<SinkEvent>, Error>;
 
-    /// Feed entry from the new index
-    fn new_block(
-        &mut self,
-        hash: &HashDigest,
-        size: usize,
-    ) -> Result<(), Error>;
-
-    /// End of files
-    fn end_files(&mut self) -> Result<(), Error>;
-
-    /// Feed a block that was requested
-    fn feed_block(
-        &mut self,
-        hash: &HashDigest,
-        block: &[u8],
-    ) -> Result<(), Error>;
-
-    /// Ask which blocks to get next
-    fn next_requested_block(&mut self) -> Result<Option<HashDigest>, Error>;
+    fn feed_event(&mut self, SourceEvent) -> Result<(), Error>;
 
     /// Are we waiting on blocks?
     fn is_missing_blocks(&self) -> Result<bool, Error>;
-}
-
-/// Events that are received from the index data.
-#[derive(Debug)]
-pub enum IndexEvent {
-    /// Start a new file (e.g. next `NewBlock` are blocks of that file)
-    NewFile(PathBuf, chrono::DateTime<chrono::Utc>),
-
-    /// Add a new block to the current file
-    NewBlock(HashDigest, usize),
-
-    /// End of the whole transfer
-    End,
 }
 
 /// The source, representing where the files are coming from.
@@ -84,68 +74,18 @@ pub enum IndexEvent {
 /// that reads from files, and the receiving side has a source that reads from
 /// the network.
 pub trait Source {
-    /// Get the next event from the index data
-    fn next_from_index(&mut self) -> Result<Option<IndexEvent>, Error>;
+    fn next_event(&mut self) -> Result<SourceEvent, Error>;
 
-    /// Asynchronously request a block from this source
-    fn request_block(&mut self, hash: &HashDigest) -> Result<(), Error>;
-
-    /// Get a block that was previously requested
-    fn get_next_block(
-        &mut self,
-    ) -> Result<Option<(HashDigest, Vec<u8>)>, Error>;
-}
-
-/// Additional methods for `Sink`, through an auto-implemented trait
-pub trait SinkExt {
-    /// Feed a whole new index
-    fn new_index(&mut self, index: &IndexTransaction) -> Result<(), Error>;
-}
-
-impl<R: Sink> SinkExt for R {
-    fn new_index(&mut self, index: &IndexTransaction) -> Result<(), Error> {
-        for (file_id, path, modified) in index.list_files()? {
-            self.new_file(&path, modified)?;
-            for (hash, _offset, size) in index.list_file_blocks(file_id)? {
-                self.new_block(&hash, size)?;
-            }
-        }
-        self.end_files()?;
-        Ok(())
-    }
+    fn feed_event(&mut self, SinkEvent) -> Result<(), Error>;
 }
 
 impl<R: Sink + ?Sized> Sink for Box<R> {
-    fn new_file(
-        &mut self,
-        path: &Path,
-        modified: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), Error> {
-        (**self).new_file(path, modified)
+    fn next_event(&mut self) -> Result<Option<SinkEvent>, Error> {
+        (**self).next_event()
     }
 
-    fn new_block(
-        &mut self,
-        hash: &HashDigest,
-        size: usize,
-    ) -> Result<(), Error> {
-        (**self).new_block(hash, size)
-    }
-
-    fn end_files(&mut self) -> Result<(), Error> {
-        (**self).end_files()
-    }
-
-    fn feed_block(
-        &mut self,
-        hash: &HashDigest,
-        block: &[u8],
-    ) -> Result<(), Error> {
-        (**self).feed_block(hash, block)
-    }
-
-    fn next_requested_block(&mut self) -> Result<Option<HashDigest>, Error> {
-        (**self).next_requested_block()
+    fn feed_event(&mut self, event: SourceEvent) -> Result<(), Error> {
+        (**self).feed_event(event)
     }
 
     fn is_missing_blocks(&self) -> Result<bool, Error> {
@@ -154,18 +94,12 @@ impl<R: Sink + ?Sized> Sink for Box<R> {
 }
 
 impl<S: Source + ?Sized> Source for Box<S> {
-    fn next_from_index(&mut self) -> Result<Option<IndexEvent>, Error> {
-        (**self).next_from_index()
+    fn next_event(&mut self) -> Result<SourceEvent, Error> {
+        (**self).next_event()
     }
 
-    fn request_block(&mut self, hash: &HashDigest) -> Result<(), Error> {
-        (**self).request_block(hash)
-    }
-
-    fn get_next_block(
-        &mut self,
-    ) -> Result<Option<(HashDigest, Vec<u8>)>, Error> {
-        (**self).get_next_block()
+    fn feed_event(&mut self, event: SinkEvent) -> Result<(), Error> {
+        (**self).feed_event(event)
     }
 }
 
@@ -205,36 +139,39 @@ pub fn do_sync<S: Source, R: Sink>(
     mut source: S,
     mut sink: R,
 ) -> Result<(), Error> {
-    let mut instructions = true;
-    while instructions || sink.is_missing_blocks()? {
-        // Things are done in order so that bandwidth is used in a smart way
-        // For example, if you block on sending block data, you will have
-        // received more block requests in the next loop, and you'll only
-        // transmit (sender side) or process (receiver side) index instructions
-        // when there's nothing better to do
-        if let Some(hash) = sink.next_requested_block()? {
-            // Block requests
-            source.request_block(&hash)?; // can block on HTTP receiver side
-        } else if let Some((hash, block)) = source.get_next_block()?
-        // blocks on receiver side
-        {
-            // Block data
-            sink.feed_block(&hash, &block)?; // blocks on sender side
-        } else if let Some(event) = source.next_from_index()? {
-            // Index instructions
-            match event {
-                IndexEvent::NewFile(path, modified) => {
-                    sink.new_file(&path, modified)?
-                }
-                IndexEvent::NewBlock(hash, size) => {
-                    sink.new_block(&hash, size)?
-                }
-                IndexEvent::End => {
-                    sink.end_files()?;
-                    instructions = false;
+    loop {
+        let event = source.next_event()?;
+        info!(" > {:?}", event);
+        if let SourceEvent::End = event {
+            sink.feed_event(event)?;
+            break;
+        } else {
+            sink.feed_event(event)?;
+        }
+    }
+
+    let mut recv = true;
+    while recv || sink.is_missing_blocks()? {
+        if recv {
+            if let Some(event) = sink.next_event()? {
+                info!(" < {:?}", event);
+                if let SinkEvent::End = event {
+                    recv = false;
+                    source.feed_event(event)?;
+                    continue;
+                } else {
+                    source.feed_event(event)?;
                 }
             }
         }
+
+        match source.next_event()? {
+            SourceEvent::End => {}
+            e => sink.feed_event(e)?,
+        }
     }
+    // TODO: Source needs two "end" signal: end of index, end of transfer
+
+    info!("Transfer complete");
     Ok(())
 }

@@ -11,6 +11,7 @@
 
 extern crate cdchunking;
 extern crate chrono;
+extern crate copy_in_place;
 #[macro_use] extern crate log;
 extern crate rusqlite;
 extern crate sha1;
@@ -56,26 +57,8 @@ impl From<std::io::Error> for Error {
     }
 }
 
-/// Type for the hashes
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct HashDigest([u8; 20]);
-
-impl ToSql for HashDigest {
-    fn to_sql(&self) -> Result<ToSqlOutput, rusqlite::Error> {
-        // Write the hash to buffer on the stack, we know the size
-        let mut buffer = Vec::with_capacity(40);
-        for byte in &self.0 {
-            write!(&mut buffer, "{:02x}", byte).unwrap();
-        }
-        // Hexadecimal chars are ASCII, cast to string
-        let string = String::from_utf8(buffer).unwrap();
-
-        Ok(ToSqlOutput::from(string))
-    }
-}
-
 #[derive(Debug)]
-enum InvalidHashDigest {
+pub enum InvalidHashDigest {
     WrongSize,
     InvalidChar,
 }
@@ -95,28 +78,55 @@ impl fmt::Display for InvalidHashDigest {
 
 impl std::error::Error for InvalidHashDigest {}
 
+/// Type for the hashes
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct HashDigest([u8; 20]);
+
+impl HashDigest {
+    pub fn to_hex(&self) -> String {
+        // Write the hash to buffer on the stack, we know the size
+        let mut buffer = Vec::with_capacity(40);
+        for byte in &self.0 {
+            write!(&mut buffer, "{:02x}", byte).unwrap();
+        }
+        // Hexadecimal chars are ASCII, cast to string
+        String::from_utf8(buffer).unwrap()
+    }
+
+    pub fn from_hex(s: &str) -> Result<HashDigest, InvalidHashDigest> {
+        if s.len() != 40 {
+            Err(InvalidHashDigest::WrongSize)
+        } else {
+            let mut bytes = [0u8; 20];
+            for (i, byte) in (&mut bytes).iter_mut().enumerate() {
+                *byte = u8::from_str_radix(&s[i * 2 .. i * 2 + 2], 16)
+                    .map_err(|_| InvalidHashDigest::InvalidChar)?;
+            }
+            Ok(HashDigest(bytes))
+        }
+    }
+}
+
+impl ToSql for HashDigest {
+    fn to_sql(&self) -> Result<ToSqlOutput, rusqlite::Error> {
+        Ok(ToSqlOutput::from(self.to_hex()))
+    }
+}
+
 impl FromSql for HashDigest {
     fn column_result(
         value: rusqlite::types::ValueRef,
     ) -> Result<HashDigest, FromSqlError> {
         value.as_str().and_then(|s| {
-            if s.len() != 40 {
-                Err(FromSqlError::Other(Box::new(
-                    InvalidHashDigest::WrongSize,
-                )))
-            } else {
-                let mut bytes = [0u8; 20];
-                for (i, byte) in (&mut bytes).iter_mut().enumerate() {
-                    *byte = u8::from_str_radix(&s[i * 2 .. i * 2 + 2], 16)
-                        .map_err(|_| {
-                            FromSqlError::Other(Box::new(
-                                InvalidHashDigest::InvalidChar,
-                            ))
-                        })?;
-                }
-                Ok(HashDigest(bytes))
-            }
+            HashDigest::from_hex(s)
+                .map_err(|e| FromSqlError::Other(Box::new(e)))
         })
+    }
+}
+
+impl fmt::Debug for HashDigest {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "HashDigest({})", self)
     }
 }
 
@@ -131,10 +141,13 @@ impl fmt::Display for HashDigest {
 
 #[cfg(test)]
 mod tests {
-    use rusqlite::types::{FromSql, ToSql, ToSqlOutput, Value, ValueRef};
+    use rusqlite::types::{
+        FromSql, ToSql, ToSqlOutput,
+        Value, ValueRef,
+    };
     use sha1::Sha1;
 
-    use super::HashDigest;
+    use super::{HashDigest};
 
     #[test]
     fn test_hash_tosql() {
@@ -159,5 +172,24 @@ mod tests {
             "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3",
         ));
         assert_eq!(hash.unwrap(), digest);
+
+        let hash = <HashDigest as FromSql>::column_result(ValueRef::Text(
+            "a94a8fe5ccb19ba61c4c0873",
+        ));
+        match hash {
+            Err(e) => assert_eq!(format!("{}", e), "Invalid hash: wrong size"),
+            Ok(_) => panic!(),
+        }
+
+        let hash = <HashDigest as FromSql>::column_result(ValueRef::Text(
+            "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+        ));
+        match hash {
+            Err(e) => assert_eq!(
+                format!("{}", e),
+                "Invalid hash: invalid character",
+            ),
+            Ok(_) => panic!(),
+        }
     }
 }
